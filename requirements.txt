@@ -1,0 +1,9 @@
+celery==5.3.6          # Quản lý hàng đợi và tác vụ chạy ngầm
+kombu==5.3.5           # Giao tiếp với RabbitMQ/Redis
+boto3==1.34.0          # Giao tiếp với AWS S3
+ffmpeg-python==0.2.0   # Chạy lệnh FFmpeg trong Python
+librosa==0.10.1        # Phân tích âm thanh (AI)
+numpy==1.26.4          # Tính toán toán học (pin numpy<2 cho librosa compat)
+requests==2.31.0       # Gọi Webhook về lại .NET
+soundfile==0.12.1      # Backend đọc file audio cho librosa
+pika==1.3.2            # Consumer chat_voice_processed (DSP vibe)
