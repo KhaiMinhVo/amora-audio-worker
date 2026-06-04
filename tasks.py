@@ -40,13 +40,15 @@ s3 = boto3.client(
 
 def _report_to_dotnet(payload: dict) -> None:
     """Gọi Webhook về .NET, kèm secret header để xác thực nguồn gốc."""
+    logger.info(f"[Webhook] Bắt đầu gọi: {config.DOTNET_WEBHOOK_URL}")
     try:
-        requests.post(
+        response = requests.post(
             config.DOTNET_WEBHOOK_URL,
             json=payload,
             headers={"X-Webhook-Secret": config.WEBHOOK_SECRET},
             timeout=10,
         )
+        logger.info(f"[Webhook] HTTP Status: {response.status_code}, Body: {response.text}")
     except requests.RequestException as exc:
         logger.error(f"[Webhook] Không thể báo về .NET: {exc}")
 
