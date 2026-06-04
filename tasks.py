@@ -81,12 +81,7 @@ def process_voice_post(self, post_id: str, s3_file_key: str):
         if not success:
             raise RuntimeError("FFmpeg xử lý thất bại.")
 
-        # ── Bước 3: Phân tích AI cho Pet ─────────────────────────────────────
-        logger.info("[Worker] 🐾 Extracting voice vibe for Pet...")
-        vibe_data = extract_voice_vibe(clean_path)
-        logger.info(f"[Worker] Vibe data: {vibe_data}")
-
-        # ── Bước 4: Upload file đã xử lý đè lên S3 ───────────────────────────
+        # ── Bước 3: Upload file đã xử lý đè lên S3 ───────────────────────────
         # Dùng prefix "clean_" để phân biệt với file gốc
         clean_key = s3_file_key.replace("voices/", "voices/clean_", 1)
         logger.info(f"[Worker] ↑ Uploading clean audio → s3://{config.S3_BUCKET_NAME}/{clean_key}")
@@ -97,13 +92,13 @@ def process_voice_post(self, post_id: str, s3_file_key: str):
             ExtraArgs={"ContentType": "audio/mp4"},
         )
 
-        # ── Bước 5: Báo thành công về .NET ───────────────────────────────────
+        # ── Bước 4: Báo thành công về .NET ───────────────────────────────────
         clean_audio_url = f"https://{config.S3_BUCKET_NAME}.s3.amazonaws.com/{clean_key}"
         _report_to_dotnet({
             "postId": post_id,
             "status": "Success",
             "cleanAudioUrl": clean_audio_url,
-            "petVibeData": vibe_data,
+            "petVibeData": None,
         })
         logger.info(f"[Worker] ✅ Hoàn tất Post: {post_id}")
 
