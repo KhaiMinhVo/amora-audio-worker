@@ -2,8 +2,12 @@
 
 import json
 import os
+import signal
 import tempfile
+import threading
+import time
 import urllib.parse
+from types import FrameType
 
 import boto3
 import pika
@@ -101,27 +105,134 @@ def _republish_or_dead_letter(channel, properties, body: bytes, error: Exception
     )
 
 
-def main() -> None:
-    connection = pika.BlockingConnection(pika.URLParameters(config.RABBITMQ_URL))
-    channel = connection.channel()
-    channel.queue_declare(queue=QUEUE_IN, durable=True)
-    channel.queue_declare(queue=QUEUE_FAILED, durable=True)
-    channel.confirm_delivery()
-    channel.basic_qos(prefetch_count=1)
+class ChatVoiceConsumer:
+    """Run the blocking Pika consumer and reconnect after broker interruptions."""
 
-    def callback(ch, method, properties, body):
-        try:
-            _handle_message(body)
-        except Exception as exc:
-            _republish_or_dead_letter(ch, properties, body, exc)
-            ch.basic_ack(delivery_tag=method.delivery_tag)
+    def __init__(self) -> None:
+        self._stop_event = threading.Event()
+        self._connection = None
+        self._channel = None
+        self._connected_at: float | None = None
+
+    def stop(self) -> None:
+        """Request shutdown and wake a blocking ``start_consuming`` call."""
+        self._stop_event.set()
+        connection = self._connection
+        channel = self._channel
+
+        if connection is None or not connection.is_open:
             return
 
-        ch.basic_ack(delivery_tag=method.delivery_tag)
+        def stop_consuming() -> None:
+            if channel is not None and channel.is_open:
+                channel.stop_consuming()
 
-    channel.basic_consume(queue=QUEUE_IN, on_message_callback=callback)
-    print(f"[chat-voice-consumer] Listening on {QUEUE_IN}")
-    channel.start_consuming()
+        try:
+            connection.add_callback_threadsafe(stop_consuming)
+        except (pika.exceptions.AMQPError, OSError):
+            # A concurrent connection loss will already wake start_consuming.
+            pass
+
+    def _consume_once(self) -> None:
+        connection = pika.BlockingConnection(pika.URLParameters(config.RABBITMQ_URL))
+        self._connection = connection
+
+        try:
+            channel = connection.channel()
+            self._channel = channel
+            channel.queue_declare(queue=QUEUE_IN, durable=True)
+            channel.queue_declare(queue=QUEUE_FAILED, durable=True)
+            channel.confirm_delivery()
+            channel.basic_qos(prefetch_count=1)
+
+            def callback(ch, method, properties, body):
+                try:
+                    _handle_message(body)
+                except Exception as exc:
+                    _republish_or_dead_letter(ch, properties, body, exc)
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    return
+
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+
+            channel.basic_consume(queue=QUEUE_IN, on_message_callback=callback)
+            self._connected_at = time.monotonic()
+            print(
+                f"[chat-voice-consumer] Listening on {QUEUE_IN}",
+                flush=True,
+            )
+
+            if not self._stop_event.is_set():
+                channel.start_consuming()
+        finally:
+            self._channel = None
+            self._connection = None
+            if connection.is_open:
+                try:
+                    connection.close()
+                except (pika.exceptions.AMQPError, OSError):
+                    pass
+
+    def run_forever(self) -> None:
+        retry_delay = config.RABBITMQ_RETRY_INITIAL_SECONDS
+
+        while not self._stop_event.is_set():
+            self._connected_at = None
+            try:
+                self._consume_once()
+                if not self._stop_event.is_set():
+                    print(
+                        "[chat-voice-consumer] Consumer stopped unexpectedly.",
+                        flush=True,
+                    )
+            except (pika.exceptions.AMQPError, OSError) as exc:
+                if not self._stop_event.is_set():
+                    print(
+                        "[chat-voice-consumer] RabbitMQ connection lost: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+
+            if self._stop_event.is_set():
+                break
+
+            if (
+                self._connected_at is not None
+                and time.monotonic() - self._connected_at
+                >= config.RABBITMQ_RETRY_RESET_SECONDS
+            ):
+                retry_delay = config.RABBITMQ_RETRY_INITIAL_SECONDS
+
+            print(
+                "[chat-voice-consumer] Reconnecting in "
+                f"{retry_delay:g} seconds...",
+                flush=True,
+            )
+            self._stop_event.wait(retry_delay)
+            retry_delay = min(
+                retry_delay * 2,
+                config.RABBITMQ_RETRY_MAX_SECONDS,
+            )
+
+        print("[chat-voice-consumer] Stopped.", flush=True)
+
+
+def _install_signal_handlers(consumer: ChatVoiceConsumer) -> None:
+    def handle_signal(signum: int, _frame: FrameType | None) -> None:
+        print(
+            f"[chat-voice-consumer] Received signal {signum}; shutting down...",
+            flush=True,
+        )
+        consumer.stop()
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+
+def main() -> None:
+    consumer = ChatVoiceConsumer()
+    _install_signal_handlers(consumer)
+    consumer.run_forever()
 
 
 if __name__ == "__main__":
