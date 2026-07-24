@@ -1,7 +1,5 @@
-"""
-tasks.py
-Celery Task chính: nhận job từ RabbitMQ, xử lý audio, báo kết quả về .NET.
-"""
+"""Celery tasks for processing voice posts and reporting results to .NET."""
+
 import os
 import tempfile
 
@@ -12,26 +10,21 @@ from celery.utils.log import get_task_logger
 
 import config
 from services.audio_processor import clean_audio_with_ffmpeg
-from services.pet_analyzer import extract_voice_vibe
 
-# ── Khởi tạo Celery App ───────────────────────────────────────────────────────
-app = Celery('amora_worker', broker=config.RABBITMQ_URL)
-
-# Đảm bảo task name khớp với cách .NET publish (Celery protocol v1)
+app = Celery("amora_worker", broker=config.RABBITMQ_URL)
 app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_backend=None,          # Không cần lưu result (đã dùng Webhook)
+    task_serializer="json",
+    accept_content=["json"],
+    result_backend=None,
     worker_concurrency=config.WORKER_CONCURRENCY,
-    task_acks_late=True,          # Chỉ ACK sau khi xử lý xong, tránh mất job khi crash
-    worker_prefetch_multiplier=1, # Mỗi worker chỉ giữ 1 job mỗi lúc (phù hợp tác vụ nặng)
+    task_acks_late=True,
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,
 )
 
 logger = get_task_logger(__name__)
-
-# ── Khởi tạo S3 Client ────────────────────────────────────────────────────────
 s3 = boto3.client(
-    's3',
+    "s3",
     aws_access_key_id=config.AWS_ACCESS_KEY_ID,
     aws_secret_access_key=config.AWS_SECRET_ACCESS_KEY,
     region_name=config.AWS_REGION,
@@ -39,52 +32,41 @@ s3 = boto3.client(
 
 
 def _report_to_dotnet(payload: dict) -> None:
-    """Gọi Webhook về .NET, kèm secret header để xác thực nguồn gốc."""
-    logger.info(f"[Webhook] Bắt đầu gọi: {config.DOTNET_WEBHOOK_URL}")
-    try:
-        response = requests.post(
-            config.DOTNET_WEBHOOK_URL,
-            json=payload,
-            headers={"X-Webhook-Secret": config.WEBHOOK_SECRET},
-            timeout=10,
-        )
-        logger.info(f"[Webhook] HTTP Status: {response.status_code}, Body: {response.text}")
-    except requests.RequestException as exc:
-        logger.error(f"[Webhook] Không thể báo về .NET: {exc}")
+    """Report a terminal state to .NET; non-2xx responses are failures."""
+    logger.info("[Webhook] Calling %s", config.DOTNET_WEBHOOK_URL)
+    response = requests.post(
+        config.DOTNET_WEBHOOK_URL,
+        json=payload,
+        headers={"X-Webhook-Secret": config.WEBHOOK_SECRET},
+        timeout=10,
+    )
+    logger.info("[Webhook] HTTP %s", response.status_code)
+    response.raise_for_status()
 
 
 @app.task(bind=True, max_retries=3, default_retry_delay=30)
 def process_voice_post(self, post_id: str, s3_file_key: str):
-    """
-    Task chính — được Celery gọi khi .NET bắn message vào queue.
+    logger.info("[Worker] Processing Post=%s Key=%s", post_id, s3_file_key)
 
-    Args:
-        post_id     : ID của VoicePost cần xử lý.
-        s3_file_key : Key của file gốc trên S3, ví dụ "voices/uuid.m4a".
-    """
-    logger.info(f"[Worker] ▶ Bắt đầu xử lý Post: {post_id} | Key: {s3_file_key}")
-
-    # Dùng tempfile để tự động dọn dẹp kể cả khi crash
-    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as raw_f, \
-         tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as clean_f:
-        raw_path = raw_f.name
-        clean_path = clean_f.name
+    with tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as raw_file, \
+         tempfile.NamedTemporaryFile(suffix=".m4a", delete=False) as clean_file:
+        raw_path = raw_file.name
+        clean_path = clean_file.name
 
     try:
-        # ── Bước 1: Tải file gốc từ S3 ───────────────────────────────────────
-        logger.info(f"[Worker] ↓ Downloading s3://{config.S3_BUCKET_NAME}/{s3_file_key}")
+        metadata = s3.head_object(Bucket=config.S3_BUCKET_NAME, Key=s3_file_key)
+        if int(metadata.get("ContentLength", 0)) > config.MAX_AUDIO_BYTES:
+            raise ValueError("Audio file is too large")
         s3.download_file(config.S3_BUCKET_NAME, s3_file_key, raw_path)
 
-        # ── Bước 2: Lọc nhiễu & Chuẩn hóa âm lượng ──────────────────────────
-        logger.info("[Worker] 🎙 Denoising & normalizing...")
-        success = clean_audio_with_ffmpeg(raw_path, clean_path)
-        if not success:
-            raise RuntimeError("FFmpeg xử lý thất bại.")
+        if not clean_audio_with_ffmpeg(raw_path, clean_path):
+            raise RuntimeError("FFmpeg audio processing failed")
 
-        # ── Bước 3: Upload file đã xử lý đè lên S3 ───────────────────────────
-        # Dùng prefix "clean_" để phân biệt với file gốc
-        clean_key = s3_file_key.replace("voices/", "voices/clean_", 1)
-        logger.info(f"[Worker] ↑ Uploading clean audio → s3://{config.S3_BUCKET_NAME}/{clean_key}")
+        if s3_file_key.startswith("voices/"):
+            clean_key = s3_file_key.replace("voices/", "voices/clean_", 1)
+        else:
+            clean_key = f"voices/clean_{os.path.basename(s3_file_key)}"
+
         s3.upload_file(
             clean_path,
             config.S3_BUCKET_NAME,
@@ -92,27 +74,41 @@ def process_voice_post(self, post_id: str, s3_file_key: str):
             ExtraArgs={"ContentType": "audio/mp4"},
         )
 
-        # ── Bước 4: Báo thành công về .NET ───────────────────────────────────
         clean_audio_url = f"https://{config.S3_BUCKET_NAME}.s3.amazonaws.com/{clean_key}"
-        _report_to_dotnet({
-            "postId": post_id,
-            "status": "Success",
-            "cleanAudioUrl": clean_audio_url,
-            "petVibeData": None,
-        })
-        logger.info(f"[Worker] ✅ Hoàn tất Post: {post_id}")
+        _report_to_dotnet(
+            {
+                "postId": post_id,
+                "status": "Success",
+                "cleanAudioUrl": clean_audio_url,
+                "petVibeData": None,
+            }
+        )
+        logger.info("[Worker] Completed Post=%s", post_id)
 
     except Exception as exc:
-        logger.error(f"[Worker] ❌ Lỗi khi xử lý Post {post_id}: {exc}")
-        try:
-            # Retry tối đa 3 lần, mỗi lần cách nhau 30 giây
-            raise self.retry(exc=exc)
-        except self.MaxRetriesExceededError:
-            # Đã hết lần retry → báo thất bại về .NET
-            _report_to_dotnet({"postId": post_id, "status": "Failed", "error": str(exc)})
+        logger.exception("[Worker] Failed Post=%s attempt=%s", post_id, self.request.retries + 1)
+
+        if self.request.retries >= self.max_retries:
+            try:
+                _report_to_dotnet(
+                    {
+                        "postId": post_id,
+                        "status": "Failed",
+                        "error": "Audio processing failed after retries.",
+                    }
+                )
+            except requests.RequestException:
+                logger.exception(
+                    "[Webhook] Unable to report terminal failure for Post=%s",
+                    post_id,
+                )
+            raise
+
+        raise self.retry(exc=exc)
 
     finally:
-        # Dọn dẹp file tạm
         for path in (raw_path, clean_path):
-            if os.path.exists(path):
+            try:
                 os.remove(path)
+            except FileNotFoundError:
+                pass
